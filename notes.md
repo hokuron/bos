@@ -172,3 +172,66 @@ That's where the `build-std` feature of cargo comes in. It allows to recompile c
 - QEMUの出力をホスト側に送信する方法として[UART](https://ja.wikipedia.org/wiki/UART)を利用できる
   - [16550 UART](https://ja.wikipedia.org/wiki/16550_UART)は互換が豊富で`uart_16550`クレートもある
   
+### [CPU Exceptions](https://os.phil-opp.com/cpu-exceptions/)
+
+- interrupt descriptor table
+  - CPU exceptionsに対応するためのハンドラー関数を提供
+    - 無効なメモリーアクセスやゼロ除算など
+- x86のCPU exceptionは約20種類
+  - https://wiki.osdev.org/Exceptions
+- タイプごとにハンドラー関数を呼び出す
+  - ハンドラー関数を呼び出し中に例外が発生した場合の例外もある(**Double Fault**)
+    - 目的のハンドラー関数が存在しなかったなど
+  - Double Faultのハンドラー関数呼び出し中にさらに例外が発生した場合は何もできない(**Triple Fault**)
+    - 自身をリセットしたりOSを再起動したりする
+
+- [The Interrupt Descriptor Table (IDT)](https://os.phil-opp.com/cpu-exceptions/#the-interrupt-descriptor-table)
+  - _segment_: Intelの用語で次のようなメモリー領域のことを言う
+    - プログラムの実行中に使用され
+    - ベースアドレス、サイズと
+    - 実行や書き込みのアクセス権限が含まれる
+  - _Global Descriptor Table (GDT)_: メモリー領域(_segments_)の特徴を定義したデータ構造体
+    - x86系プロセッサーで使われている
+    - 起源は[80286](https://en.wikipedia.org/wiki/80286)
+
+  - IDTエントリー16バイトの構造体
+    - ハンドラー関数へのポインターは3分割されている(なぜ？)
+  - IDTインデックスは事前に決められている
+    - ハードウェアは各種例外に対応するIDTエントリーを自動ロードする
+
+#### [The Interrupt Calling Convention](https://os.phil-opp.com/cpu-exceptions/#the-interrupt-calling-convention)
+
+- `extern "C" fn ...` (calling convention; 呼び出し規則)
+  - x86_64 LinuxにおけるC言語の関数のルール([System V ABI](https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf))にRustは従っていない
+  - `extern "C"`とすればそのルールに従うようになる
+
+- Preserved(Callee-saved) registers
+  - その値は関数呼び出しをまたがって変更しない
+  - 呼び出し先(callee)は、呼び出し元に戻す前に元の値に復元する場合に限って上書きが可能
+    - 関数の先頭でスタックに保存し最後に復元するのが一般的
+  - x86_64: `rbp`, `rbx`, `rsp`, `r12`, `r13`, `r14`, `r15`
+- Scratch(Caller-saved) registers
+  - calleeは、その値を制限なく書き込み(上書き)可能
+  - 呼び出し元(caller)が、関数呼び出し(callees)をまたがって値を保持する場合は、呼び出し前にスタックに保存する
+  - x86_64: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`
+
+- `extern x86-interrupt fn` calling convention
+  - `x86_64` crateの`idt::HandlerFunc`
+  - 割り込み専用？の呼び出し規則
+  - 例外発生時に全レジスター(*)を保存し、関数(ハンドラーのこと？)から戻る際に元の値に復元される
+    - 全レジスター(*)：コンパイラーは、効率化のため上書きされるレジスターのみバックアップする
+    - 例外は任意の命令(instruction)で発生する
+      - 対して通常の関数は、コンパイラーによって挿入された`call`命令により呼び出される
+    - コンパイル時はどのコードが例外を発生されるか(ほとんどの場合)予知できない
+      - 例外発生を予見してその直前にあらかじめレジスターの内容をバックアップすることもできない
+      - 同じ理由で、例外ハンドラーでcaller-saved registerに依存する呼び出し規則を使用することもできない
+  - 例外ハンドラーの引数は、スタック上の特定のオフセットから取り出す
+    - [Interrupt Stack Frame](https://os.phil-opp.com/cpu-exceptions/#the-interrupt-stack-frame)で配置が決まっているから？
+    - 通常の呼び出し規則では、引数はレジスターで渡されるが、`x86-interrupt`呼び出し規則では上書きが禁止されておりそれができない
+  - リターン命令(instruction)は、通常の関数呼び出し時の`ret`ではなく`iretq`命令を使う
+  - エラーコードの複雑な処理(*)を行う必要がある
+    - 複雑な処理：例外ごとにエラーコードの有無があり、それによってスタックの配置(アライメント；alignment)が変わり、ハンドラーから戻る前にポップする必要がある
+  - ただし、ハンドラーと例外の紐付けがないため、複雑な処理を行うべき関数かどうかは([Interrupt Stack Frame](https://os.phil-opp.com/cpu-exceptions/#the-interrupt-stack-frame)内の？)引数の数から推論する必要がある
+    - `x86_64` crateの`InterruptDescriptorTable`は正しい紐付けを型安全な方法で保証してくれる
+  
+  
