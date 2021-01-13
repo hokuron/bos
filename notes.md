@@ -234,4 +234,63 @@ That's where the `build-std` feature of cargo comes in. It allows to recompile c
   - ただし、ハンドラーと例外の紐付けがないため、複雑な処理を行うべき関数かどうかは([Interrupt Stack Frame](https://os.phil-opp.com/cpu-exceptions/#the-interrupt-stack-frame)内の？)引数の数から推論する必要がある
     - `x86_64` crateの`InterruptDescriptorTable`は正しい紐付けを型安全な方法で保証してくれる
   
-  
+### [Double Fault](https://os.phil-opp.com/double-fault-exceptions/)
+
+- 目的のハンドラーがスワップアウトされている場合でも発生しうる
+  - 絶対ではない。代わりにPage Faultになりうる。詳細は後述
+- エラーコードは常に`0`
+- 返り値はなし([`Diverging function`](https://doc.rust-lang.org/stable/rust-by-example/fn/diverging.html))
+- [AMD 64マニュアル](https://www.amd.com/system/files/TechDocs/24593.pdf)には正確な定義が載っている
+  - > double fault exception _can_ occur when a second exception occurs during the handling of a prior (first) exception handler”
+  - "_can_"が重要で、ごく限られた例外の組み合わせでdouble faultが発生する
+    - [具体例](https://os.phil-opp.com/double-fault-exceptions/#causes-of-double-faults)
+- 発生した例外に対するIDTエントリーがない(0個)場合、General Protection Faultが発生する
+- さらにそれを定義していない場合、別のGeneral Protection Faultを呼び出そうとしたときにDouble Faultとなる
+  - = 単純に、発生した例外に対するハンドラーがないからDouble Faultになる、というロジックではなく、特定の例外の組み合わせが呼び出された時に発生する
+
+- guard page
+  - スタックオーバーフローを感知するため、スタックの(最?)下部に配置される特殊なメモリーページ
+  - ブートローダーが設定してくれる
+  - 物理フレームにはマッピングされていないため、Page Faultが発生する
+  - 発生時にinterrupt stack frameをそのスタックにプッシュすると、再びPage FaultとなりDouble Faultが発生する
+  - それでもguard pageを指したままなのでThird Faultが発生してしまう
+    - = 再起動されてしまう
+  - Double Faultのスタックにはguard pageは存在しない(一般的にはどうなの？)
+    - スタックオーバーフローは、そのスタック以下のメモリーを破壊するかもしれないから
+  - スタックオーバーフローは、止まらない再帰呼び出しを行えば簡単に発生させられる
+- x86_64アーキテクチャーは、正常なスタックに切り替える能力を持っている
+  - ハードウェアレベル行われるため、CPUが例外スタックフレームをプッシュする前に切り替えられる
+- Interrupt Stack Table (IST)
+  - 切り替えの仕組みは、ISTとして実装されている
+  - 7つの正常なスタックのポインターから成る
+    - Double Faultは0番目()
+    - x86はリトルエンディアンなので、トップアドレスを指定する
+      - [コード上](https://os.phil-opp.com/double-fault-exceptions/#creating-a-tss)では、ポインターに`stack_end`を指定している
+  - IDTエントリーの`stack_pointer`フィールドを介してISTのスタックを選択する
+- Task State Segment (TSS)
+  - 32-bit mode:
+    - プロセッサーレジスターの状態などのタスクについての様々な情報の保持
+    - [I/O許可ビットマップ(I/O port permissions bitmap)](https://ja.wikipedia.org/wiki/Task_state_segment#I/O許可ビットマップ) Stack Tableの保持
+    - コンテキストスイッチ
+  - 64-bit mode:
+    - 32-bit modeと同じく[I/O許可ビットマップ(I/O port permissions bitmap)](https://ja.wikipedia.org/wiki/Task_state_segment#I/O許可ビットマップ) Stack Tableの保持
+    - ISTの保持
+    - Privilege Stack Tableの保持
+      - privilege levelごとのスタックへのポインターから成る
+      - CPUがユーザーモード中に例外が発生した際、カーネルモードに切り替えてから例外ハンドラーを呼び出す
+      - その時にPrivilege Stack Tableの0番目のスタックに切り替える
+    - コンテキストスイッチは持たない
+        - 64-bit modeではサポート外
+- Global Descriptor Table (GDT)
+  - 64-bitモードでは主に以下の用途がある
+    - カーネルスペースとユーザースペースの切り替え
+    - TSS構造のロード
+  - かつてはメモリーの[セグメント方式(memory segmentation)](https://ja.wikipedia.org/wiki/セグメント方式)で使われていた
+    - ページングがデファクトになる以前のことで、プログラムを他から隔離するのに利用
+- [末尾再帰#末尾呼出し最適化](https://ja.wikipedia.org/wiki/末尾再帰#末尾呼出し最適化)
+  - 関数の最後が再帰呼び出しの場合、通常のループに変換する最適化方法
+  - この変換により、スタックフレームの追加作成が行われずその使用量を一定に保てる
+  - これを防ぐ(今回は意図的にスタックオーバーフローを発生させたい)には、[Volatile](https://docs.rs/volatile/0.2.6/volatile/struct.Volatile.html)型を利用する
+- `allow(unconditional_recursion)`
+  - 上記の最適化防止による無限ループ発生に対するコンパイラーの警告を抑える
+
