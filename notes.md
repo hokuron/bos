@@ -1,6 +1,6 @@
 # Writing an OS in Rust
 
-## Learning Points
+## Learned Points
 
 ### [A Freestanding Rust Binary](https://os.phil-opp.com/freestanding-rust-binary/)
 
@@ -294,3 +294,226 @@ That's where the `build-std` feature of cargo comes in. It allows to recompile c
 - `allow(unconditional_recursion)`
   - 上記の最適化防止による無限ループ発生に対するコンパイラーの警告を抑える
 
+### [Hardware Interrupts](https://os.phil-opp.com/hardware-interrupts/)
+
+- キーボード入力の例
+  - 定期的にカーネルがハードウェア(キーボード)に入力を確認させる(ポーリング)のではなく、
+  - 入力される度にキーボードがカーネルにそれを通知する
+- Interrupt Controller
+  - 接続されたハードウェアを含む端末の割り込みを集約し、CPUに通知する
+    - ハードウェアは直接CPUと繋げられないため、このInterrupt Controllerを通す
+  - ほとんどのinterrupt controllerは、割り込みの優先レベルをサポートしている(programmable)
+    - 正確性が求められるタイマーは、キーボードよりも優先されるなど
+- ハードウェア割り込みは非同期で発生する
+
+- Programmable Interrupt Controller (PIC)
+  - [Intel 8259](https://ja.wikipedia.org/wiki/Intel_8259)
+  - APIC (Advanced PIC)
+    - 8259との互換性有り
+  - APICより8259の方がセットアップが簡単
+- 8259
+  - 8本の割り込み(要求)ラインと、CPUとの通信用ラインを数本所有
+  - プライマリー、セカンダリーの2つのPICを備える
+    - プライマリーの割り込みラインの1つに、セカンダリーが接続される
+    - | secondary | - | primary | - | CPU |
+  - 割り込みライン15本(セカンダリー8本、プライマリー7本(1本はセカンダリーとの接続で使用))のほとんどは、割り当てを固定化されている
+  - 各コントローラーは、I/Oポートを介して構成される
+    - primary: 
+      - `0x20` ("command" port) 
+      - `0x21` ("data" port)
+    - secondary:
+      - `0xa0` ("command" port) 
+      - `0xa1` ("data" port)
+  - PICの割り込み番号は再マッピングする必要がある
+    - デフォルトでは0~15の割り込み番号を送信する
+      - 0~15は、CPU exceptionsに占有済み
+    - 最初の空き番号である32から、47までの範囲が一般的に選択される
+  - この設定は、command, data portsに特別な値を書き込むことで行われる
+    - [`pic8259_simple`](https://docs.rs/crate/pic8259_simple/0.2.0/source/src/lib.rs) crateが代わりにやってくれる！
+- End of Interrupt (EOI)
+  - 割り込みは処理され、システムが次の割り込みの受け入れ可能になったことを示すシグナル
+  - PICは、このシグナルをハンドラーから明示的に受け取る必要がある
+  - セカンダリーPICから送信した割り込みに対するEOIシグナルは、セカンダリーが接続されているプライマリーPICにも届く
+
+- timer interrupt
+  - 実行中のプロセスを定期的に中断し制御をカーネルに戻す
+  - その際にカーネルは別プロセスに切り替えることもできる
+  - こうすることで複数のプロセスが同時に実行しているように見せかけられる
+    - 高校時代に習った「高速ペロペロキャンディー」
+- Programmable Interval Timer (PIT)
+  - 次の割り込みまでの間隔を設定できる
+
+- [x86_64::without_interrupts](https://docs.rs/x86_64/0.12.1/x86_64/instructions/interrupts/fn.without_interrupts.html)
+  - 割り込みフリー(interrupt-free)な環境で実行されるクロージャーを提供する
+    - Mutexロックが解放されない限り割り込みが発生しない
+  - `vga_buffer::print`の実装にある`WRITER`をロック中に割り込みが発生し、その割り込みハンドラー(非同期実行)の中で`print!`を実行しようとするとデッドロックが発生する
+  - 短時間だけ割り込みを無効にする場合には有効な手段
+    - それ以外では、割り込み待ちに要する時間が長くなりシステムの(割り込みに対する)反応が悪く(長く)なってしまう
+
+- Scancode
+  - キーボードコントローラーが読み取った押されたキーの情報
+
+
+### [Introduction to Paging](https://os.phil-opp.com/paging-introduction/)
+
+- x86におけるメモリー保護は、segmentationとpagingの2種類
+
+- Segmentation
+  - Fragmentation(後述)が原因でx86の64-bitモードではサポートされていない機能
+    - 代わりにPaging(後述)が使われ、Fragmentationへ対処している
+  - かつて(1978-)は、アドレス指定可能なメモリ量を増やすためのものだった
+  - CPUは16-bitのアドレスのみ使用していたため、アドレス指定できるメモリ量は64KiBに制限されていた
+  - セグメントレジスター _群_ (_registers_)を追加し最大1MiBまでアクセスできるようにした
+    - それぞれのレジスターにはオフセットアドレスが含まれ
+    - CPUは各メモリーへのアクセスにこのオフセットを自動で加算していた
+  - CPUは、メモリーアクセスの種類ごとにセグメントレジスターを選ぶ
+    - `CS`(Code Segment): instructionのフェッチ
+    - `SS`(Stack Segment): プッシュ・ポップのスタック操作
+    - `DS`(Data Segment), `ES`(Extra Segment): その他のinstructions
+    - `FS`(Free?), `GS`(General?): 自由に使える(なんの略かは記載なし)
+      - のちに追加された
+  - 保護モード([Protected Mode](https://en.wikipedia.org/wiki/X86_memory_segmentation#Protected_mode))
+    - segment descriptorにlocal or global descriptor tableへのインデックスが含まれる
+      - オフセットアドレスとセグメントのサイズ、アクセスパーミッションが含まれるテーブル
+    - プロセスごとに別々のlocal/global descriptor tableをロードすることで、OSはプロセスを相互に分離できる
+      - プロセスは、メモリーアクセスできる範囲を自身のメモリー領域に制限される
+  - 実際のメモリーアクセス前にアドレスを変更する = 仮想メモリー
+
+- [Virtual Memory](https://os.phil-opp.com/paging-introduction/#virtual-memory)
+  - ストレージからメモリーアドレスを抽象化する
+  - ストレージに間接的にアクセスするため、 選択中のセグメントのオフセットアドレスを加算する変換ステップが最初に行われる
+  - _virtual(仮想)_: 変換前の呼び名で、そのアドレスは変換機能によって異なる
+    - 異なるアドレスが同じ物理アドレスを指す場合もあれば、同じアドレスが異なる物理アドレスを指すこともある(変換機能依存)
+  - _physical(物理)_: 変換後の呼び名で、そのアドレスは一意でメモリー位置ごとに常に同じ場所を参照する
+  - OSは、プログラムの再コンパイルなしに利用可能なメモリーをフルに利用できる
+    - プログラムが異なる仮想アドレスを使用していても、物理メモリーの位置は任意の場所に配置できる(同じ場所でも異なる場所でも両方可能)
+- [Fragmentation](https://os.phil-opp.com/paging-introduction/#fragmentation)
+  - 物理メモリーが歯抜けの状態
+  - 仮想メモリーと同じサイズを物理メモリー上に _連続して_ 確保できない
+  - オフセットを詰めれば歯抜けは解消できる
+    - プログラムの実行を一時中断したり物理メモリーの大量コピーが発生したり、それを定期的に実行したりとパフォーマンス劣化につながる
+
+- [Paging](https://os.phil-opp.com/paging-introduction/#paging)
+  - 仮想・物理メモリー空間の両方を固定サイズの小さなブロックに分割
+  - Page: 仮想メモリー空間のブロック
+  - Frame: 物理アドレス空間のブロック
+  - 各pageは個別にframeに紐付けられるため、大きなメモリー領域を非連続的な物理フレームに分割できる
+    - デフラグ不要
+  - frameは、すべて同じサイズで、このサイズより小さいサイズで使われることはなく、segmentationのような断片化は起き得ない
+- Internal Fragmentation ([Hidden Fragmentation](https://os.phil-opp.com/paging-introduction/#hidden-fragmentation))
+  - 全てのメモリー領域が確実にpageサイズの倍数となるわけではない
+    - size 50 per page; size 101 -> 3 pages; size 150, remainder size 49
+  - internal fragmentationはサイズを無駄にするものの、デフラグはする必要がなく、segmentationのそれ(_External Fragmentation_ という)とは違い断片化量は*予測可能なのでまだマシ
+    - *予測可能：メモリー領域あたり平均して半分のpageが断片化する
+- [Page Table](https://os.phil-opp.com/paging-introduction/#page-tables)
+  - pageとframeの紐付け情報を保持するテーブル
+  - プログラムごとに自身のpage tableを持つ
+  - `CR3`レジスター：↑からどのpage tableが選択されているかを保持しているレジスターで、`x86`においては`CR3`となっている
+    - 保持しているのは、page tableへのポインター
+  - OSは、プログラム開始前に`CR3`をロードし、page tableのポインターを得る
+  - tableポインターの読み込み -> pageから紐付けられたframeを探索 -> メモリーアクセスを効率良くするため、多くのCPUではこの変換結果をキャッシュする
+    - キャッシュ方法によってはパーミッションも保持する
+- [Multilevel Page Tables](https://os.phil-opp.com/paging-introduction/#multilevel-page-tables)
+  - (たぶんpageの)アドレス領域ごとに異なるpage tablesを使用する
+    - 少数のpageと対応するframeであっても、pageが100万単位の歯抜け状態ではpage tableが巨大になってしまう
+      - pageとテーブルのインデックスが一致しているとは限らないため、CPUは直接目的のエントリーに飛べない
+  - level 2: 追加されたpage tableで、アドレス領域ごとに対応するlevel 1を間接的(*)に持つ
+    - 間接的(*): 次のレベル(level 1)のテーブルが格納？されている物理メモリ(frame)と紐付けれる
+  - level 1: 前述までのpageとframeを紐付けたpage table
+    - level 2のアドレス領域は引き継がないためオフセットは持たない
+    - (必ず？)page "0"から始まる
+    - frameは物理アドレスを示す(仮想アドレスだと再起的に変換が繰り返されてしまう)
+  - 歯抜け分のlevel 1 page tablesが無くなるため、tableを構築するために必要なメモリー利用が節約できる
+  - level 2, level 1構成は、**two-level page table**という
+  - より多くのlevelを増やすことも可能
+  - `CR3`のようなpage tableを指すレジスターは、もっとも高いレベルのテーブルを参照している
+  - 各レベルのテーブルは、次の下位レベルのテーブルを指していく
+  - _multilevel_ または _hierarchical page table_
+
+#### [Paging on x86_64](https://os.phil-opp.com/paging-introduction/#paging-on-x86-64)
+
+- 4-levels構成
+- pageサイズは4KiB
+- 各page tableのエントリー数は512個で固定
+  - 1エントリー8バイト； 512 * 8 = 4KiB
+- page tableのインデックスは仮想アドレス(リンク先の画像参照)から直接取得できる
+  - インデックスは9ビットで構成され、12-48ビットの間にレベル1-4の順で配置
+    - 2^9=512となりエントリー数の512個と一致する
+  - 0-12ビットはpageのオフセット
+    - TODO: "2^12 bytes = 4KiB"の謎(12-bitなのに急にbytesが登場)を解く
+    - 変換過程の最後、level 1から最終的なframeを発見後、そのframeにオフセットを加算し物理アドレスを導き出す
+  - 48-64は破棄され、47ビット目のコピーとなっており5-level目のサポートを見越して予約されている
+    - この構成が2の補数に似ていることから _sign-extension_ と呼ばれる
+    - sign-extensionになっていなければCPUは例外を投げる
+    - x86_64は実際には48ビットまでしかサポートしてない
+      - "Ice Lake"(以降？)ではオプションで5-level目のサポートをした
+- x86_64(64-bit mode)では、4-level paging階層が強制される
+  - ブートローダーを設定した時点で達成できている
+    - カーネルのpageとframeの紐付けや、正しいアクセス権限の設定
+
+- [Page Table Format](https://os.phil-opp.com/paging-introduction/#page-table-format)
+  - `x86_64` crateは、[PageTable](https://docs.rs/x86_64/0.12.1/x86_64/structures/paging/page_table/struct.PageTable.html)と[PageTableEntry](https://docs.rs/x86_64/0.12.1/x86_64/structures/paging/page_table/struct.PageTableEntry.html)を提供してくれる
+  - エントリーの構成は、12-51ビットが物理メモリーの格納場所でframeか次レベルのpage tableを指す
+  - それ以外はフラグまたはOSが自由に使えるようになっている
+  - bit 0; `present`: 紐付けされたpageとされていないpageを区別する
+    - ページを一時的にスワッピング(swap out)するのに使用
+    - その状態でページがアクセスされるとpage fault例外が発生し、OSがページを再ロード(swap in?)しプログラムが続行される
+  - bit 1; `writable`, bit 63; `no executable`: 読んで字の如く
+  - bit 5; `accessed`, bit 6; `dirty`: pageに対して読み書き発生時にCPUが自動でセットするフラグ
+    - どのページをスワッピング(swap-out)するか、ページを保存以降に変更されたかなどOSが活用できる情報となる
+  - bit 3; `write through caching`, bit 4; `disable cached`: 個々のpageのキャッシュ制御
+  - bit 2; `user accessible`: ユーザー空間のコードからpageが利用可能かのフラグで、許可されていなければ、CPUがカーネルモードの場合にのみアクセスできる
+    - システムコールを高速化できる
+      - ユーザー空間のプログラムを実行中にカーネルマッピング(kernel mapped)を維持する(切り替え不要ってこと？)
+    - [Spectre](https://ja.wikipedia.org/wiki/Spectre)の脆弱性で、ユーザー空間のプログラムからもページが見れるようになってしまった..
+  - bit 8; `global`: pageが全アドレス空間で利用可能で、アドレス空間スイッチの変換キャッシュから削除不要("Translation Lookaside Buffer"で後述)であることをハードウェアに通知する
+    - 通常、カーネルのコードを全アドレス空間と紐付けするために使われる
+      - 許可された(cleared)`user accessible`と一緒に利用される
+  - bit 8; `huge page`: より大きなサイズのpagesを作成できるかのフラグ
+    - これは、level 2またはlevel 3のpage tablesが、紐付けられたframeを直接指すようにすることで可能にする
+    - pageサイズは、512倍に増えlevel 2, 3のそれぞれのエントリーは2MiB(512 * 4KiB)、1GiB(512 * 2MiB)になる
+    - 変換キャッシュの行数および必要とするpage tablesを削減できる
+
+- [Translation Lookaside Buffer](https://os.phil-opp.com/paging-introduction/#the-translation-lookaside-buffer)
+  - page tableの最後の数個の変換結果をキャッシュし、ヒットした変換をスキップする仕組み
+    - 4つのレベルの変換は、それぞれメモリーアクセスが必要で高価になってしまうため
+  - `invlpg` (invalidate page) instruction: 特別なCPU命令で、TLB中の指定したpageの変換(のキャッシュ？)を削除し、次回アクセス時にpage tableから再ロードさせる：
+    1. 他のCPUキャッシュと違い、page tableの内容が変わっても(キャッシュした？)変換の更新や削除は行わないため
+    2. カーネルがpage tableを変更するたびに、カーネルはまた、TLBを手動で更新する必要があるため
+  - `CR3`レジスターをリロードすることでバッファーに書き込む(flush)ことも可能
+    - (復習)`CR3`レジスターは、アドレス空間を切り替える
+    - `x86_64` crateでは`tld`モジュールが存在する
+
+- `CR2`レジスター：page fault発生時にCPUが自動でセットする
+  - 発生時にアクセスした仮想アドレスを保持する
+
+### [Paging Implementation](https://os.phil-opp.com/paging-implementation/)
+
+#### [Accessing Page Tables](https://os.phil-opp.com/paging-implementation/#accessing-page-tables)
+
+- page tableの各エントリーは、次点のテーブルの _物理_ アドレスを保持している
+  - さもないとアドレス変換の無限ループに陥ってしまう
+- 特定のアドレスにアクセスする場合、それは、page tableに格納される物理アドレスにアクセするのではなく、仮想アドレスにアクセスすることになる
+- 物理アドレスへのアクセスは、それに紐づけられている仮想アドレスを介すしかない
+  - ブートローダーがpage table階層を設定しているため、カーネルも仮想アドレス上で動作し、物理アドレスへの直接アクセスができない
+- いくつかのvirtual pageをphysical page frameに紐付けることで、任意のpage table frameにアクセスできるようにする
+
+- `bootloader` crateの`entry_point`マクロを使えばカーネルのエントリーポイントである`_start()`メソッドの代わりとなる任意の関数を指定できる
+  - `extern "C"`や`[no_mangle]`も不要になる
+
+- `unsafe fn`の中身は、`unsafe`ブロックで囲む必要がない([RFC](https://github.com/rust-lang/rfcs/pull/2585))
+  - 関数本体全体を`unsafe`ブロックで囲んだ場合と同等の扱いとなる
+- 実際は`unsafe`ブロックを使わない、セマンティック的に安全でない操作(メモリーの直操作など)を表現した`unsafe fn`の場合、本当に`unsafe`な操作が紛れ込んでも気付きにくい
+- そのような`unsafe fn`内部では、すぐさま通常の`unsafe`ではないプライベートな`fn`を呼び出すことでこの問題を避けられる
+
+```rust
+pub unsafe fn unsafe_modify() {
+    no_need_unsafe_block_modify()
+}
+
+fn no_need_unsafe_block_modify() {
+    // no `unsafe` blocks
+    // ...
+    // ...
+}
+```
