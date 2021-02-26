@@ -517,3 +517,148 @@ fn no_need_unsafe_block_modify() {
     // ...
 }
 ```
+
+### [Heap Allocation](https://os.phil-opp.com/heap-allocation/)
+
+- Local Variable
+  - ローカル変数は、[コールスタック](https://ja.wikipedia.org/wiki/コールスタック)(スタック構造；`push`と`pop`操作可能)上に格納される
+  - 呼び出された関数の引数、戻り(値？)アドレスとローカル変数は、コンパイラーがプッシュする
+- Static Variable
+  - スタック("the stack"; コールスタックを指している？)から分離された固定のメモリーロケーションに格納される
+    - 固定のメモリーロケーション：リンカーがコンパイル時に割り当て、実行可能形式にエンコードされる
+  - コンパイル時に格納場所が判明しているため、アクセスの際に参照行為は不要となる
+    - 静的変数へのアクセスに静的変数を指す別の変数は導入せずとも、直接アクセスが可能
+  
+#### [Dynamic Memory](https://os.phil-opp.com/heap-allocation/#dynamic-memory)
+
+- ローカル変数も静的変数もそのサイズは固定である必要がある
+  - 動的に要素が追加され増大するコレクション系の値は直接格納できない
+  - 条件付きでそれを可能にする提案がなされている [RFC #1909: Unsized Rvalues](https://github.com/rust-lang/rust/issues/48055)
+- 解決策：**heap**; _dynamic memory allocation_
+  - `allocate`: 指定したサイズのメモリーの空きチャンクを返す。変数はそこに格納する
+    - 指定サイズのメモリーブロックを確保し、`*mut`のような生ポインターを返す
+  - `deallocate`: 格納した変数の参照を使って、↑を開放する。変数の寿命もそこまで
+
+#### [The Allocator Interface](https://os.phil-opp.com/heap-allocation/#the-globalalloc-trait)
+
+- [GlobalAlloc](https://doc.rust-lang.org/alloc/alloc/trait.GlobalAlloc.html) trait
+  - allocationとその収集が必要な場所に、コンパイラーがこのtraitのメソッドの呼び出しコードを挿入する
+    - プログラマーが明示的に利用することはない
+  - `alloc`メソッド：[`Layout`](https://doc.rust-lang.org/alloc/alloc/struct.Layout.html)インスタンス(サイズとアライメント)を引数に取り、割り当てを行ったメモリーブロックの1バイト目の生ポインター(`*mut u8`)を、または、エラー時にNULLポインターを返す
+  - `dealloc`メソッド：`alloc`の返却値とそれに渡された引数`Layout`を引数に取る
+  - `alloc_zeroed`メソッド：`alloc`を呼び出し、割り当てメモリーブロックをゼロ化する
+    - デフォルト実装あり
+  - `realloc`メソッド：割り当てを増やしたり減らしたりする
+    - デフォルト実装では、指定されたサイズの新たなメモリーブロックを割り当て、元の割り当て内容をコピーする
+  - trait自身と各メソッドは、`unsafe`として定義されている
+    - 前者は、実装者が正しく実装していることを保証する必要があるため
+      - 未使用で有効なメモリーブロックを割り当てるなど
+    - 後者は、呼び出し側がさまざまな不変条件を保証する必要があるため
+      - `Layout`のサイズが0はダメなど
+      - ただ、呼び出し元はコンパイラーとなるため、これらの要件は確実に満たされる
+- [`#[global_allocator]` Attribute](https://os.phil-opp.com/heap-allocation/#the-global-allocator-attribute)
+  - アロケーターインスタンスがどれをコンパイラーに伝える
+  - `static`変数にする必要がある
+- [`alloc_error_handler` Attribute](https://os.phil-opp.com/heap-allocation/#the-alloc-error-handler-attribute)
+  - `alloc`メソッドのエラーを表すぬるぽを返した際に呼び出される関数を指定する
+    - 引数は、`alloc`に渡された`Layout`インスタンスが渡ってくる
+  - 安定化しておらずfeature gateが必要
+
+#### [Creating a Kernel Heap](https://os.phil-opp.com/heap-allocation/#creating-a-kernel-heap)
+
+1. 任意の(まだ使われていない)仮想メモリー領域を決める
+  - ヒープの開始アドレスからヒープサイズを足したアドレスまで
+    - 0スタートなので最後に1を引いたのがヒープの終端アドレス
+  - ヒープアドレスの開始と終了をそれぞれ`Page::containing_address()`で`Page`型に変換
+  - `Page::range_inclusive()`でpage領域を作成
+1. その領域を物理メモリーと紐付ける
+  - page領域をイテレートして個別のpageに分解
+  - pageと紐づける物理frameを確保し (`FrameAllocator::allocate_frame()`)
+    - 残りフレームがなければエラーとする (`MapToError::FrameAllocatorFailed`)
+  - pageに読み書きのフラグをセット (`PageTableFlags::PRESENT | WRITABLE`)
+    - これらのアクセス許可はヒープメモリーにとって重要
+  - pageとframeを紐づける (`Mapper.map_to()`)
+  - Translation Lookaside Buffer(TLB)に書き込む (`MapperFlush.flush()`)
+
+### [Allocator Designs](https://os.phil-opp.com/allocator-designs/)
+
+カーネルコードのallocationパターンは、ユーザースペースのそれと比べると単純。
+
+#### [Bump Allocator](https://os.phil-opp.com/allocator-designs/#bump-allocator)
+
+- _Stack Allocator_ とも言う
+- もっとも単純なデザイン
+- メモリーを線状に割り当て、割り当てたバイト数と割り当て数を追跡する
+- メモリーの解放は、1回ですべて行うことしかできないため、特定のユースケースでのみ有効なデザインとなっている
+- `next`変数：未使用のメモリーの先頭を指す(ヒープの先頭アドレスを指すところから始まる)
+  - 割り当てを行うごとに増加していく(increasing; _bumping_; 進ませる；移す)
+  - ヒープの最後のアドレスに向かって一方向に増加し、割り当て不可状態になった後、割り当てを行おうとすると、out-of-memoryエラーになる
+- 割り当てカウンターを持ち、それが0(すべての割り当てが解放されたことを意味する)になると`next`変数は再びヒープの先頭アドレスを指す
+  - `alloc`で1増加、`dealloc`で1減少する
+- 早い
+  - アセンブリレベルの数個の命令へと最適化される
+  - virtual DOMライブラリーにも利用されている
+- global allocatorとして使われることはあまりなく、原理がarena allocatorの形で適用されることが多い
+  - arena allocatorは、個々のallocatorをまとめる
+- 全割り当てが解放されるまでメモリの再利用ができない
+  - 割り当て後すぐに解放されても`next`の位置を戻さない(戻せない)
+
+
+- [`GlobalAlloc` and Mutability](https://os.phil-opp.com/allocator-designs/#globalalloc-and-mutability)
+  - `GlobalAlloc` traitの必須メソッドは、_nonmutating_ (`&self`)
+  - `#[global_allocator]` attributeで指定する変数は、`static`にする必要あるため、_mutating_ (`&mut self`) なメソッドじゃない
+  - `spin::Mutex`(内部可変性；interior mutability)を利用する
+
+#### [Linked List Allocator](https://os.phil-opp.com/allocator-designs/#linked-list-allocator)
+
+- 別名 _Pool Allocator_
+- メモリーの空き領域自体に解放された領域の情報を持たせる
+  - 情報：その空き領域のサイズおよび次の空き領域への(先頭)ポインター
+- 解放領域追跡に関する追加のメモリーは必要無くなるため、無限の追跡が可能になる
+- パフォーマス面ではBump Allocatorより劣る
+- `head`: 最初の未使用領域のポインターのことを言う
+- [`free list`](https://en.wikipedia.org/wiki/Free_list): すべての未使用領域を追跡した構造体(linked list)を言う
+- Bump Allocatorよりも汎用的
+- 隣接する解放された領域のマージが必要になる
+  - 割り当てと解放を繰り返すごとに解放メモリー領域がフラグメントを起こす
+  - 細かい領域へと分断されていくため、比較的小さいサイズのメモリーも割り当てられなくなりエラー(`mem::null_mut()`返却)になってしまう
+- `linked_list_allocator` crateでは、解放メモリー領域の開始アドレスでソートされた状態のリストを保持し、deallocate時に直接マージすることで断片化しないようにしている
+  - タイミングはどうであれ、マージ処理が必要になることには代わりない
+- 未使用のメモリー領域の数に比例してリストが長くなるため、パフォーマンスの良し悪しは、ヒープをどれぐらい利用するか(のプログラム)に依存する
+  - Linked List Allocator自身ではなく、それを利用するプログラムによって良し悪しが決まってくる
+
+#### [Fixed-Size Block Allocator](https://os.phil-opp.com/allocator-designs/#fixed-size-block-allocator)
+
+- 固定サイズ故、必要なサイズ以上のメモリー領域を確保することがある(internal fragmentation)
+- Linked List Allocatorと比べて、ちょうどいいサイズの空き領域を探す時間を劇的に減らせる
+- 何パターンかの固定サイズの領域を用意しておき、確保時にはその中から要求メモリーサイズに収まる領域を使う
+- 未使用メモリーはLinked List Allocatorと同じようにlinked list形式で追跡する
+- ただし、サイズごとに個別のリストを作成するため、各リストには単一サイズの領域だけが格納される
+  - 単一の`head`ではなく、`head_16`, `head_512`などのようにサイズごとに専用の`head`が存在する
+  - 各リストからサイズ情報を取り除ける(次の要素へのポインターだけが残る)
+- どの`head`を使うか決まれば、そのリストの最初の要素を割り当てるだけなので、Linked List Allocatorのように走査が不要で速い
+- サイズパターンを2の累乗にするとことで、最悪の場合で割り当てサイズの半分、平均して1/4に割り当てメモリーの浪費を制限できる
+  - この場合、各パターンのアライメントとサイズと同じになる
+- カーネルは、大きめ(2KB以上)のサイズを割り当てることが稀なため、それ専用の別のallocator(fallback allocator)を用意しメモリー浪費を減らす
+- `dealloc`時もどのパターンのサイズに収まるか繰り上げ計算が必要
+  - コンパイラーは、`alloc`時に返却したサイズではなく、引数で指定してきたサイズ情報を再び`dealloc`時にも渡してくる
+- あるパターンサイズの領域が枯渇した場合：
+  1. 用意していたfallback allocatorを利用する
+  1. 枯渇したパターンより大きいパターンを分割する
+      - 16-byteが枯渇したなら、32-byteを分割し16-byteを2つ増やす(32-byteは1つ減る)
+  - 前者のほうが実装が単純
+- Linked Listよりも速くメモリー浪費が発生するが、カーネルのようなパフォーマンス重視であれば、Fixed-Sizeはより良い選択になる
+
+- [Slab Allocator](https://en.wikipedia.org/wiki/Slab_allocation)
+  - 選択された型専用のメモリー領域を直接割り当てる方法
+  - 要求された型のサイズとピッタリ一致するため、メモリー浪費がない
+  - 型によっては未使用領域を事前に初期化し、あらかじめその型のインスタンスを保持しておくことも考えられる
+  - 他のallocatorと一緒に使われることが多い
+- [Buddy Allocator](https://en.wikipedia.org/wiki/Buddy_memory_allocation)
+  - 未使用領域の追跡にbinary tree(2の累乗のブロックサイズ)を利用した方法
+  - 要求サイズによってはブロックを2分割し、解放時には隣接するブロックが未使用になると再び結合される
+  - external fragmentationが減り、小さなブロック群を大きな要求サイズに割り当てられるようになる
+  - fallback allocator要らずで、パフォーマンスが予測可能になる
+  - internal fragmentationは防げず、メモリー浪費が発生する
+  - 割り当て領域をさらに小さく分割するため、Slab Allocatorと組み合わせる場合もある
+
