@@ -662,3 +662,101 @@ fn no_need_unsafe_block_modify() {
   - internal fragmentationは防げず、メモリー浪費が発生する
   - 割り当て領域をさらに小さく分割するため、Slab Allocatorと組み合わせる場合もある
 
+### [Async/Await](https://os.phil-opp.com/async-await/)
+
+- [Preemptive Multitasking](https://os.phil-opp.com/async-await/#preemptive-multitasking)
+  - OSの機能(割り込み処理)を利用して任意の時点でスレッドを切り替える
+    - そのためにスレッドに一時停止を強制させる
+  - マウスやパケット到着、タイマーなどの割り込みの度にCPUの制御を奪い(regain)、割り込みハンドラーでタスクを切り替える
+    - 最初の2つの割り込みは受動的で、最後のタイマーは、意図的に仕込めば能動的に割り込みのタイミングを設定できる
+  - [Saving State](https://os.phil-opp.com/async-await/#saving-state)
+    - タスク切り替え時に処理が中断されたタスクのすべての状態は、OSがバックアップし処理再開に備える ([_context switch_](https://ja.wikipedia.org/wiki/コンテキストスイッチ)という)
+      - 状態にはcall stackとCPUレジスターのすべての値が含まれる
+    - しかし、call stackは巨大になり得るため、call stackの内容をバックアップする代わりに、タスクごとに個別のcall stackを設定する (このタスクをお馴染み[_thread_](https://ja.wikipedia.org/wiki/スレッド_(コンピュータ))と言う)
+    - 個別スタックを用いることで、context switchへはCPUレジスターの値のみ保持させるだけで済む
+    - 最大で毎秒100回発生するcontext switchのオーバーヘッドを最小化できる
+  - メリット
+    - OSがタスクの実行時間を完全に制御できるため、各タスクはCPUタイムを公平に共有可能(fair share)
+    - 第三者のタスクや複数ユーザーで共有されるシステムにおいては重要事項
+  - デメリット
+    - 各タスクごとにcall stackが必要になるため、メモリー使用量が多くなったり、タスク数に制限がかかることが多い(共有call stack比)
+    - タスク切り替えの度に、未使用のCPUレジスターを含めてすべての状態を保存する必要がある
+  - Preemptive MultitaskingとThreadは、OSの基本的なコンポーネント
+    - 信頼できないユーザー空間のプログラムを実行するためにも必要
+
+- [Cooperative Multitasking](https://os.phil-opp.com/async-await/#cooperative-multitasking)
+  - タスクがCPUの制御を定期的に放棄する必要がある
+  - Preemptive Multitaskingとは異なり、タスクが自主的に都合の良いタイミング(例えばI/O待ち中)でCPUの制御を放棄する
+  - coroutineやasync/awaitなどプログラミング言語レベルで用いられる
+    - プラグラマーかコンパイラーが[`yield`](https://en.wikipedia.org/wiki/Yield_(multithreading))(CPUの制御を放棄し別のタスクを実行させる)をプログラム中に挿入する
+  - 非同期操作([非同期I/O](https://ja.wikipedia.org/wiki/非同期IO)など)と組み合わせて利用するのが一般的
+    - 非同期操作は、その操作が完了していない場合"no ready"状態を返却する
+    - この時、↑の完了を待機しているタスクは、`yield`を実行して他のタスクを実行させられる
+  - [Saving State](https://os.phil-opp.com/async-await/#saving-state-1)
+    - タスクは、いつ停止するか自身で決めるためOSに頼らずに、実行再開時に必要な状態を過不足なく停止前に保存する
+    - これによりパフォーマスに優れている
+    - Rustなどは、call stackの必要な部分をバックアップする
+      - 必要なすべてのローカル変数を自動生成された構造体に格納する
+    - すべてのタスクで単一のcall stackを共有できるため、メモリー使用量が大幅に削減できる
+      - Preemptive Multitaskingとは違い、任意の数のタスクが作成可能になる
+  - デメリット
+    - uncooperativeなタスクが制限なく実行される可能性がある
+      - 悪意のあるタスク、バグってるタスクは、他のタスク実行を妨げ、システム全体に影響を与える恐れがある
+    - すべてのタスクがcooperativeであることが必要(そうでないならCooperative Multitaskingは使うべきではない)
+    - OSは、任意のユーザーレベルのプログラムに依存させるのは避けるべき
+  - メリット
+    - 強力なパフォーマスとメモリーの利点は、非同期操作との組み合わせが最適
+    - カーネルは、パフォーマスが重要なプログラムなので、Cooperative Multitaskingは非同期ハードウェアと相互作用させるのに優れた方法となる
+
+#### [Async/Await in Rust](https://os.phil-opp.com/async-await/#async-await-in-rust)
+
+- `future`
+  - `poll`メソッドは、`Pin<&mut Self>`(`self:`)と`&mut Context`(`Waker`を内包)を引数にとる
+- コンパイラーは、`async`関数本体をstate machineに変換する
+  - `.await`の呼び出しそれぞれで異なる状態(state)を表現する
+  - このstate machineは、`Future` traitを実装する
+  - "Start"から"End"まで状態の変遷が起きる
+    - その間の状態は`.await`呼び出しの数に依存する
+  - "End"に達すると`poll`メソッドで、`Poll::Ready`(結果を内包するvariant)を返す
+  - それまでは待ち状態(`.await`呼び出しごとにつくれらる状態)に遷移し`Poll::Pending`を返す
+  - 次の`poll`メソッド呼び出し時に最後の待ち状態から再開する
+  - ↑これを実現するためにstate machineは、
+    - 内部で現在の状態を追跡し続けたり
+    - 再開する処理で使う変数(ローカル変数や実引数)を保存したりする必要がある
+  - 保存される変数は、stateに紐付けられる構造体のフィールドとして変換される
+    - state一つひとつはenumのvariantで、各構造体はそれらに内包される
+    - 両者ともコンパラーが自動で生成する
+  - `future`そのものは、最初の`poll`メソッドが呼び出されるまで何もしない
+- [Pinning](https://os.phil-opp.com/async-await/#pinning)
+  - [Self-Referential Structs](https://os.phil-opp.com/async-await/#self-referential-structs)
+    - 自身のフィールドの一部を参照するポインターを持つ場合もself-referential structとなる
+    - moveした際、参照先のアドレスが変わっても、そのポインターが新しいアドレスに追随していない状態になる
+    - pinningはこのmoveを禁止する
+  - `Box`でラップしてヒープに収めても、`mem::replace`や`mem::swap`できるので、同じアドレスに固定しておくのは難しい
+  - `Pin`はラッパータイプ、`Unpin`はtrait (auto trait)
+  - `Pin`がラッピングしている値を`&mut`として安全に取り出すには、その値の型が`Unpin`である必要がある
+  - self-referential structから`Unpin`をopt-outすれば、moveによってアドレスが変わらないことが保証される
+    - `PhantomPinned`型のフィールドを用意するとout-outされる
+  - async/awaitで生成された`Future`インスタンスは、self-referentialになることがあるため、`poll`メソッドのレシーバーは`self: Pin<&mut Self>`となる
+  - 加えて、`poll`メソッドの呼び出しの間(中)にmoveしないよう`Unpin`はout-outされる
+- [Executors](https://os.phil-opp.com/async-await/#executors)
+  - 独立したtasksとしてfuturesをスポーンする([spawn](https://en.wikipedia.org/wiki/Spawn_(computing)))
+  - 全futuresが完了するまでポーリングする
+  - 全futuresを集約することで、`Poll::Pending`が返された際に別のfutureに切り替えることが可能になる
+    - 並列(parallel)で処理できCPUを使い続けられる(the CPU is kept busy)
+  - スレッドプールを作成し複数のCPUコアを利用する
+  - [work stealing](https://en.wikipedia.org/wiki/Work_stealing)(手持ち無沙汰になったら他のコアのキューに積まれたタスクを奪う)を活用してコア間の負荷を分散する
+  - レイテンシーとメモリーオーバーヘッドが少ないシステムに組み込みのexecutorもある
+  - ポーリングを反復するオーバーヘッドを避けるために、Rustのfutureでサポートされている _waker_ APIも利用する
+- [Wakers](https://os.phil-opp.com/async-await/#wakers)
+  - [`Waker`](https://doc.rust-lang.org/nightly/core/task/struct.Waker.html)は、`poll`メソッドの引数で渡される[`Context`](https://doc.rust-lang.org/nightly/core/task/struct.Context.html)にラップされる
+  - executorが作成し、非同期タスクが完了(一部完了)を通知するのに使われる
+  - executorは、`poll`呼び出し時に`Poll::Pending`が返されたら、対応するwakerから通知されるまでは再び繰り返し`poll`を呼ばなくて済む
+- [ExecutorsとWakersはCooperative Multitasking](https://os.phil-opp.com/async-await/#cooperative-multitasking-1)
+  - executorのtaskは、cooperative task
+  - futureは、`Poll::Pending`を返却することでCPUの制御を放棄している
+    - やろうと思えば`Poll::Pending`を返さずに処理を実行し続けられる
+  - futureは、次の`poll`呼び出し上で実行を続けるのに必要なすべてのstateを格納している
+  - async/awaitでは、↑で必要なすべての変数を検出し、生成したstate machine内に格納する
+    - cooperative multitaskingが必要な状態を自身で保存するのと一緒の挙動
+

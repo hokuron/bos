@@ -8,6 +8,9 @@ edition = "2018"
 
 [dependencies]
 bootloader = { version = "0.9.11", features = ["map_physical_memory"] }
+conquer-once = { version = "0.3.2", default-features = false }
+crossbeam-queue = { version = "0.3.1", features = ["alloc"], default-features = false }
+futures-util = { version = "0.3.13", features = ["alloc"], default-features = false }
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 linked_list_allocator = "0.8.11"
 pc-keyboard = "0.5.1"
@@ -15,7 +18,7 @@ pic8259_simple = "0.2.0"
 spin = "0.7.0"
 uart_16550 = "0.2.10"
 volatile = "0.2.6"
-x86_64 = "0.12.2"
+x86_64 = "0.13.2"
 
 [package.metadata.bootimage]
 test-args = [
